@@ -74,6 +74,7 @@
 #define MODES_DEBUG_NOPREAMBLE (1<<4)
 #define MODES_DEBUG_NET (1<<5)
 #define MODES_DEBUG_JS (1<<6)
+#define MODES_DEBUG_JSON (1<<7)
 
 /* When debug is set to MODES_DEBUG_NOPREAMBLE, the first sample must be
  * at least greater than a given level for us to dump the signal. */
@@ -129,6 +130,7 @@ struct {
     pthread_mutex_t data_mutex;     /* Mutex to synchronize buffer access. */
     pthread_cond_t data_cond;       /* Conditional variable associated. */
     unsigned char *data;            /* Raw IQ samples buffer */
+    unsigned char *data2;           /* Copy of data */
     uint16_t *magnitude;            /* Magnitude vector */
     uint32_t data_len;              /* Buffer length. */
     int fd;                         /* --ifile option file descriptor. */
@@ -136,6 +138,8 @@ struct {
     uint32_t *icao_cache;           /* Recently seen ICAO addresses cache. */
     uint16_t *maglut;               /* I/Q -> Magnitude lookup table. */
     int exit;                       /* Exit from the main loop when true. */
+    uint32_t json_msg_count;        /* Number of messages that are dumped. */
+    unsigned long long iq_data_offset; /* Position of I/Q data .*/ 
 
     /* RTLSDR */
     int dev_index;
@@ -274,6 +278,8 @@ void modesInitConfig(void) {
     Modes.interactive_ttl = MODES_INTERACTIVE_TTL;
     Modes.aggressive = 0;
     Modes.interactive_rows = getTermRows();
+    Modes.json_msg_count = 0;
+    Modes.iq_data_offset = 0;
 }
 
 void modesInit(void) {
@@ -295,11 +301,13 @@ void modesInit(void) {
     Modes.aircrafts = NULL;
     Modes.interactive_last_update = 0;
     if ((Modes.data = malloc(Modes.data_len)) == NULL ||
+        (Modes.data2 = malloc(Modes.data_len)) == NULL ||
         (Modes.magnitude = malloc(Modes.data_len*2)) == NULL) {
         fprintf(stderr, "Out of memory allocating data buffer.\n");
         exit(1);
     }
     memset(Modes.data,127,Modes.data_len);
+    memset(Modes.data2,127,Modes.data_len);
 
     /* Populate the I/Q -> Magnitude lookup table. It is used because
      * sqrt or round may be expensive and may vary a lot depending on
@@ -446,6 +454,7 @@ void readDataFromFile(void) {
             memset(p,127,toread);
         }
         Modes.data_ready = 1;
+        Modes.iq_data_offset += MODES_DATA_LEN;  /* Current end position in the I/Q file. */
         /* Signal to the other thread that new data is ready */
         pthread_cond_signal(&Modes.data_cond);
     }
@@ -550,6 +559,43 @@ void dumpRawMessageJS(char *descr, unsigned char *msg,
     fclose(fp);
 }
 
+/* Produce a raw representation of the message as a Javascript file
+ * loadable by debug.html. */
+void dumpRawMessageJSON(char *descr, unsigned char *msg, uint32_t offset, int fixable)
+{
+    unsigned char *p = Modes.data2; 
+    Modes.json_msg_count += 1;
+    unsigned long long global_offset = Modes.iq_data_offset - MODES_DATA_LEN - (MODES_FULL_LEN-1)*4 + offset*2;
+
+    int padding = 5; /* Show a few samples before the actual start. */
+    int start = (offset - padding)*2;
+    int end = (offset + (MODES_PREAMBLE_US*2)+(MODES_LONG_MSG_BITS*2))*2 - 1;
+    FILE *fp;
+    int j, fix1 = -1, fix2 = -1;
+
+    if (fixable != -1) {
+        fix1 = fixable & 0xff;
+        if (fixable > 255) fix2 = fixable >> 8;
+    }
+
+    if ((fp = fopen("frames.json","a")) == NULL) {
+        fprintf(stderr, "Error opening frames.json: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    fprintf(fp,"\"%d\": {\"descr\": \"%s\", \"offset\": %llu, \"mag\": [", Modes.json_msg_count, descr, global_offset);
+    for (j = start; j <= end; j++) {
+        fprintf(fp,"%d", j < 0 ? 0 : p[j]);
+        if (j != end) fprintf(fp,",");
+    }
+    fprintf(fp,"], \"fix1\": %d, \"fix2\": %d, \"bits\": %d, \"hex\": \"",
+        fix1, fix2, modesMessageLenByType(msg[0]>>3));
+    for (j = 0; j < MODES_LONG_MSG_BYTES; j++)
+        fprintf(fp,"%02X",msg[j]);
+    fprintf(fp,"\"},\n");
+    fclose(fp);
+}
+
 /* This is a wrapper for dumpMagnitudeVector() that also show the message
  * in hex format with an additional description.
  *
@@ -575,6 +621,10 @@ void dumpRawMessage(char *descr, unsigned char *msg,
         fixable = fixSingleBitErrors(msg,msgbits);
         if (fixable == -1)
             fixable = fixTwoBitsErrors(msg,msgbits);
+    }
+
+    if (Modes.debug & MODES_DEBUG_JSON){
+        dumpRawMessageJSON(descr, msg, offset, fixable);
     }
 
     if (Modes.debug & MODES_DEBUG_JS) {
@@ -2450,6 +2500,7 @@ void showHelp(void) {
 "                  p = Log frames with bad preamble\n"
 "                  n = Log network debugging info\n"
 "                  j = Log frames to frames.js, loadable by debug.html.\n"
+"                  J = Log frames to frames.json (for Python processing).\n"
     );
 }
 
@@ -2536,6 +2587,7 @@ int main(int argc, char **argv) {
                 case 'p': Modes.debug |= MODES_DEBUG_NOPREAMBLE; break;
                 case 'n': Modes.debug |= MODES_DEBUG_NET; break;
                 case 'j': Modes.debug |= MODES_DEBUG_JS; break;
+                case 'J': Modes.debug |= MODES_DEBUG_JSON; break;
                 default:
                     fprintf(stderr, "Unknown debugging flag: %c\n", *f);
                     exit(1);
@@ -2596,6 +2648,7 @@ int main(int argc, char **argv) {
             continue;
         }
         computeMagnitudeVector();
+        memcpy(Modes.data2, Modes.data, Modes.data_len);   // Shaun: make a copy before it is updated. 
 
         /* Signal to the other thread that we processed the available data
          * and we want more (useful for --ifile). */
