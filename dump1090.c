@@ -94,6 +94,8 @@
 
 #define MODES_NOTUSED(V) ((void) V)
 
+struct timeval tv;
+
 /* Structure used to describe a networking client. */
 struct client {
     int fd;         /* File descriptor. */
@@ -567,6 +569,7 @@ void dumpRawMessageJSON(char *descr, unsigned char *msg, uint32_t offset, int fi
     Modes.json_msg_count += 1;
     unsigned long long global_offset = Modes.iq_data_offset - MODES_DATA_LEN - (MODES_FULL_LEN-1)*4 + offset*2;
 
+
     int padding = 5; /* Show a few samples before the actual start. */
     int start = (offset - padding)*2;
     int end = (offset + (MODES_PREAMBLE_US*2)+(MODES_LONG_MSG_BITS*2))*2 - 1;
@@ -583,7 +586,12 @@ void dumpRawMessageJSON(char *descr, unsigned char *msg, uint32_t offset, int fi
         exit(1);
     }
 
-    fprintf(fp,"\"%d\": {\"descr\": \"%s\", \"offset\": %llu, \"mag\": [", Modes.json_msg_count, descr, global_offset);
+    gettimeofday(&tv, NULL);
+//    tv.tv_sec;   // seconds
+//    tv.tv_usec;  // microseconds
+
+
+    fprintf(fp,"\"%d\": {\"descr\": \"%s\", \"ts_sec\": \"%ld\", \"ts_usec\": \"%d\", \"offset\": %llu, \"mag\": [", Modes.json_msg_count, descr, tv.tv_sec, tv.tv_usec, global_offset);
     for (j = start; j <= end; j++) {
         fprintf(fp,"%d", j < 0 ? 0 : p[j]);
         if (j != end) fprintf(fp,",");
@@ -2587,7 +2595,7 @@ int main(int argc, char **argv) {
                 case 'p': Modes.debug |= MODES_DEBUG_NOPREAMBLE; break;
                 case 'n': Modes.debug |= MODES_DEBUG_NET; break;
                 case 'j': Modes.debug |= MODES_DEBUG_JS; break;
-                case 'J': Modes.debug |= MODES_DEBUG_JSON; break;
+                case 'J': Modes.debug |= MODES_DEBUG_JSON; fprintf(stderr, ">>> JSON MODE \n"); break;
                 default:
                     fprintf(stderr, "Unknown debugging flag: %c\n", *f);
                     exit(1);
